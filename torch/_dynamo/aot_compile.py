@@ -584,11 +584,16 @@ class AOTCompiledFunction:
         f_locals.update(bind_locals(self._artifacts.signature, *args, **kwargs))
         return f_locals
 
+    def _live_guard_manager(self) -> "GuardManagerWrapper":
+        # Narrowing for pyrefly, not a live check: __post_init__ always leaves a
+        # populated guard_manager (only serialize() nulls it, on a copy).
+        if self._artifacts.guard_manager is None:
+            raise AssertionError("live artifact must have a guard_manager")
+        return self._artifacts.guard_manager
+
     def guard_check(self, *args: Any, **kwargs: Any) -> bool:
         f_locals = self.prepare_f_locals(*args, **kwargs)
-        if self._artifacts.guard_manager is None:
-            raise AssertionError("guard_manager must not be None")
-        return self._artifacts.guard_manager.check(f_locals)
+        return self._live_guard_manager().check(f_locals)
 
     def __post_init__(self) -> None:
         from .package import load_guard_manager, load_guards_state
@@ -781,11 +786,9 @@ class AOTCompiledFunction:
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        if self._artifacts.guard_manager is None:
-            raise AssertionError("guard_manager must not be None")
         if self._guard_check_enabled and not self.guard_check(*args, **kwargs):
             f_locals = self.prepare_f_locals(*args, **kwargs)
-            debug_info = self._artifacts.guard_manager.check_verbose(f_locals)
+            debug_info = self._live_guard_manager().check_verbose(f_locals)
             msg = f"GuardManager check failed, reason: {debug_info}"
             if any(
                 _names_a_missing_global(part) for part in debug_info.verbose_code_parts
@@ -1318,17 +1321,73 @@ def _warn_dropped_module_dispatch(model: torch.nn.Module) -> None:
         )
 
 
+def _binding_key(artifacts: CompileArtifacts) -> tuple[object, ...]:
+    # What prepare_f_locals reads, with defaults and cells by identity (id, since
+    # the artifacts keep them alive). Signature equality is unusable here:
+    # Parameter.__eq__ takes bool() of `default == default`, which raises for a
+    # tensor default.
+    env, params = artifacts.runtime_env, artifacts.signature.parameters.values()
+    return (
+        [(p.name, p.kind, id(p.default)) for p in params],
+        env.bytecode.co_freevars,
+        [id(cell) for cell in env.closure or ()],
+    )
+
+
 @dataclass
 class AOTCompiledModel:
     # Represents a single forward function of a model along with dispatch
     # compiled_results is serializable. We require the model to deserialize again.
     model: torch.nn.Module
     compiled_results: list[AOTCompiledFunction]
+    # Whether one bind of a call serves every result, as it does for every
+    # artifact aot_compile_module produces. Decided once here rather than per
+    # call because the comparison costs about what a bind does.
+    _shared_binding: bool = dataclasses.field(init=False, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        results = self.compiled_results
+        key = _binding_key(results[0]._artifacts) if results else None
+        self._shared_binding = key is not None and all(
+            _binding_key(result._artifacts) == key for result in results[1:]
+        )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # Bound ahead of every guard, so a call the signature cannot bind still
+        # surfaces as bind_locals' TypeError, as the plain module call would; a
+        # bind costs more than a check(), so results that share one bind once.
+        results = self.compiled_results
+        shared = (
+            results[0].prepare_f_locals(self.model, *args, **kwargs)
+            if self._shared_binding
+            else None
+        )
+        bound: list[dict[str, object]] = []
+        # Guard evaluation ignores _guard_check_enabled, so scan EVERY result for
+        # a real match first: a match among the opted-out results is served in
+        # index order like any other, not only after every other tree was checked
+        # twice below.
+        for result in results:
+            f_locals = shared
+            if f_locals is None:
+                f_locals = result.prepare_f_locals(self.model, *args, **kwargs)
+            bound.append(f_locals)
+            if result._live_guard_manager().check(f_locals):
+                # The guards already passed; call fn directly so result() does
+                # not re-run the guard eval on this hot dispatch path.
+                return result.fn(self.model, *args, **kwargs)
+        # A check() rejection is not final: the dict-tag fast path can reject
+        # without running the tree, and the rejecting node then has its fast path
+        # disabled, so a second check() re-evaluates it in full. Opted-out results
+        # too: the last resort serves the FIRST of them whatever its guards say.
+        for i, result in enumerate(self.compiled_results):
+            if result._live_guard_manager().check(bound[i]):
+                return result.fn(self.model, *args, **kwargs)
+        # A result that opted out via disable_guard_check() accepts anything, but
+        # only after both passes above have failed to find a real match.
         for result in self.compiled_results:
-            if result.guard_check(self.model, *args, **kwargs):
-                return result(self.model, *args, **kwargs)
+            if not result._guard_check_enabled:
+                return result.fn(self.model, *args, **kwargs)
         # All guards failed, just run one of them and throw the guard check error.
         return self.compiled_results[0](self.model, *args, **kwargs)
 
