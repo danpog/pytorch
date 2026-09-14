@@ -506,14 +506,40 @@ def atomic_write_binary(file_path: str, data: bytes):
     os.replace(temp_path, file_path)
 
 
+def _guard_source_globals(output_graph: "OutputGraphGuardsState") -> set[str]:
+    """The global names a kept guard's own originating_source IS."""
+    # A guard certifies its own source, not the object that source is reached
+    # through, so a CHAINED source does not count: a TENSOR_MATCH on
+    # G['D']['a'] certifies that one item, while the name a load can substitute
+    # is D, whose every other key the graph would then read live and unchecked.
+    # get_global_source_name would walk such a source up to D.
+    # guard_on_key_order is deliberately not unioned in, even though a
+    # dict-order check roots a global: guard_filter_fn never prunes that set, so
+    # a name only it contributes is precisely a name no surviving guard checks
+    # the value of. On the default aot_compile filter, which drops every global
+    # guard, an iterated global dict is exactly that shape.
+    # Narrower than the serialized global_scope for the same reason: the
+    # serializer also fills that from a ShapeEnvSource guard's shape_env_sources
+    # and from DUPLICATE_INPUT's source_b -- names whose value no guard checks,
+    # and which DUPLICATE_INPUT records before its optimizer-source early return,
+    # so an optimizer-rooted pair records one with no guard installed at all.
+    from .source import GlobalSource
+
+    return {
+        guard.originating_source.global_name
+        for guard in output_graph.guards
+        if isinstance(guard.originating_source, GlobalSource)
+    }
+
+
 @dataclass
 class AOTCompiledFunction:
     _artifacts: CompileArtifacts
     _guard_check_enabled: bool = True
     _extra_globals: dict[str, object] | None = None
-    # Guard-only scope, held by reference: never merged into fn.__globals__, so a
-    # caller-supplied one cannot rewire what the compiled bytecode reads. Left
-    # None, the guards resolve against fn.__globals__ itself and are seeded into it.
+    # Guard-only scope, held by reference; kept apart from _extra_globals so
+    # nothing in it reaches the compiled bytecode but the names __post_init__
+    # picks out of it.
     _guard_globals: dict[str, object] | None = None
     # Which of the three scopes the artifact's guards resolve against, so a
     # guard failure can say something actionable about the dict the name was
@@ -523,6 +549,16 @@ class AOTCompiledFunction:
     _guard_scope: _GuardScope = dataclasses.field(
         init=False, default=_GuardScope.CAPTURED
     )
+    # Why model.forward could not be resolved to a Python function; read only
+    # by _missing_global_hint, to name that forward in its advice.
+    _forward_not_resolved_reason: str | None = None
+    # Whether a kept guard is rooted at a user global; False until a load
+    # decides it. Arms the live-value pick, and deserialize's fallback warning.
+    _has_global_guards: bool = dataclasses.field(init=False, default=False)
+    # Whether to pick the guarded names out of _guard_globals into the
+    # bytecode's globals snapshot, which only a caller that supplied a guard
+    # scope but no f_globals -- the module load path -- needs.
+    _bytecode_reads_guard_scope: bool = False
     # The rebuilt callable, set by __post_init__ (never absent on a live
     # artifact); a declared field rather than an attribute setattr'd onto the
     # instance. Out of repr and eq because the field has no default: leaving it
@@ -559,22 +595,51 @@ class AOTCompiledFunction:
 
         self._artifacts.check_compatibility()
 
-        self.fn = self._artifacts.runtime_env.forward_callable(
-            self._artifacts.backend_id,
-            self._artifacts.compiled_fn,
-            extra_globals=self._extra_globals,
-        )
-
+        extra_globals = self._extra_globals
+        guards_state = None
+        guard_scope = self._guard_globals
         if self._artifacts.guard_manager is None:
             guards_state = load_guards_state(self._artifacts.guards_state)
-            guard_scope = self._guard_globals
-            if guard_scope is None:
-                self._guard_scope = _GuardScope.RECONSTRUCTED
-                guard_scope = self.fn.__globals__
-            else:
+            output_graph = guards_state.output_graph
+            # The wide set: the serializer's own record of every name the kept
+            # guards read. Enough to arm the pick below, but not to decide what
+            # it takes -- see _guard_source_globals. The builtins dict key rides
+            # along whether or not a guard reads it, so it is not evidence.
+            builtins_key = output_graph.name_of_builtins_dict_key_in_fglobals or ""
+            recorded_globals = set(output_graph.global_scope) - {builtins_key}
+            # Dynamo's own __import_* aliases are not user globals: a rebuilt
+            # scope carries every recorded one freshly imported, so a guard
+            # rooted at one resolves there and neither half of the warning the
+            # fallback path logs applies to it.
+            aliases = set(self._artifacts.runtime_env.import_sources)
+            self._has_global_guards = bool(recorded_globals - aliases)
+            if guard_scope is not None:
                 # A live scope: a name it lacks must fail the guard rather than
                 # fall back to the value serialized with the artifact.
                 self._guard_scope = _GuardScope.SUPPLIED
+                if self._bytecode_reads_guard_scope and self._has_global_guards:
+                    # The narrow set, because a passing guard is the only thing
+                    # that certifies a live value is the one the graph was
+                    # compiled for. The builtins dict key is left out as well: a
+                    # guard rooted at it certifies the live dict itself, which
+                    # the graph's snapshot never copies.
+                    live = {
+                        name: guard_scope[name]
+                        for name in _guard_source_globals(output_graph)
+                        if name != builtins_key and name in guard_scope
+                    }
+                    extra_globals = {**(extra_globals or {}), **live}
+
+        self.fn = self._artifacts.runtime_env.forward_callable(
+            self._artifacts.backend_id,
+            self._artifacts.compiled_fn,
+            extra_globals=extra_globals,
+        )
+
+        if guards_state is not None:
+            if guard_scope is None:
+                self._guard_scope = _GuardScope.RECONSTRUCTED
+                guard_scope = self.fn.__globals__
             # Seeded AFTER forward_callable, never before: on the default path this
             # IS fn.__globals__, and PyFunction_New caches __builtins__ at creation,
             # so the __builtins__ written below cannot rewire the bytecode's lookups.
@@ -680,6 +745,18 @@ class AOTCompiledFunction:
         """Advice for a guard that failed on a global its scope does not define,
         worded for the scope the guards were actually resolved against."""
         if self._guard_scope is _GuardScope.RECONSTRUCTED:
+            if self._forward_not_resolved_reason is not None:
+                # A module load takes no f_globals=, which is the function load's
+                # parameter; _load_aot_compiled_module takes only the bytes.
+                return (
+                    " -- a guarded global is missing from the scope rebuilt from "
+                    "the artifact. That scope was rebuilt because get_traced_fn "
+                    f"cannot resolve {self._forward_not_resolved_reason} to a "
+                    "Python function; make model.forward a plain function or "
+                    "bound method so its own globals are used instead, or pass "
+                    "AOTCompiledModel.deserialize a guard_globals= scope that "
+                    "carries the name."
+                )
             return (
                 " -- a guarded global is missing from the scope rebuilt from the "
                 "artifact; load with an f_globals= that is a complete live scope "
@@ -807,6 +884,8 @@ class AOTCompiledFunction:
         external_closure_data: dict[str, Any] | None = None,
         *,
         guard_globals: dict[str, object] | None = None,
+        bytecode_reads_guard_scope: bool = False,
+        forward_not_resolved_reason: str | None = None,
     ) -> "AOTCompiledFunction":
         """Rebuild a compiled function from ``serialize()`` output.
 
@@ -819,6 +898,16 @@ class AOTCompiledFunction:
         already binds, so pass the dict those should land in. Passing neither
         resolves global guards against the scope rebuilt from the artifact, where
         a rebinding in this process is invisible.
+
+        ``bytecode_reads_guard_scope`` picks the guarded names out of
+        ``guard_globals`` into the bytecode's globals snapshot as well -- the live
+        value of each global a kept guard's own source IS, not one reached only
+        through a sub-path of it, which the guard does not certify, and apart from
+        the recorded ``__builtins_dict___N`` key, excluded by name -- one name at
+        a time. Only a caller that supplies a guard scope but no ``f_globals``
+        needs it, i.e. the module load path: such a caller cannot inspect the
+        guards itself, so it gets the substitution only where a guard certifies
+        it, and never for a global whose guard a filter dropped.
         """
         f = io.BytesIO(data)
         f.seek(0)
@@ -835,7 +924,13 @@ class AOTCompiledFunction:
         state["original_code"] = SerializedCode.to_code_object(state["original_code"])
 
         artifacts = CompileArtifacts(**state)
-        return cls(artifacts, _extra_globals=f_globals, _guard_globals=guard_globals)
+        return cls(
+            artifacts,
+            _extra_globals=f_globals,
+            _guard_globals=guard_globals,
+            _bytecode_reads_guard_scope=bytecode_reads_guard_scope,
+            _forward_not_resolved_reason=forward_not_resolved_reason,
+        )
 
     def disable_guard_check(self) -> None:
         self._guard_check_enabled = False
@@ -996,6 +1091,50 @@ def aot_compile_fullgraph(
     return aot_compiled_fn
 
 
+def _resolve_guard_scope(
+    model: torch.nn.Module,
+) -> tuple[dict[str, Any] | None, str | None]:
+    # From model.forward, not the model: for a hooked module get_traced_fn would
+    # return Module._wrapped_call_impl and nn.Module's namespace. An nn.Module
+    # forward is refused for the same reason -- get_traced_fn rewrites an
+    # nn.Module argument to THAT module's forward, rooting the guards in its
+    # namespace with nothing raising. Plain assignment cannot produce one
+    # (nn.Module.__setattr__ files a Module under _modules, and the class
+    # attribute keeps winning the lookup), but object.__setattr__ can; refusing
+    # here also keeps get_traced_fn's Module branch, whose hook reads can raise
+    # AttributeError on an uninitialized module, off this path entirely.
+    forward = model.forward
+    if not isinstance(forward, torch.nn.Module):
+        try:
+            # The __globals__ read is inside the try because get_traced_fn's
+            # __self__ branch returns __func__ unchecked.
+            return convert_frame.get_traced_fn(forward)[0].__globals__, None
+        except (RuntimeError, AttributeError):
+            pass
+    # Format forward in a bounded way to avoid dumping the entire module repr
+    # (functools.partial embeds the module's full repr).
+    forward_type = type(forward).__name__
+    forward_qualname = getattr(forward, "__qualname__", "")
+    return None, (
+        f"{type(model).__name__}.forward ({forward_type}"
+        f"{f' named {forward_qualname}' if forward_qualname else ''})"
+    )
+
+
+def _unwrap_optimized_module(model: torch.nn.Module) -> torch.nn.Module:
+    # isinstance, not getattr(model, "_orig_mod", model): _orig_mod is a
+    # registrable submodule name, and unwrapping to a child would run the
+    # parent's graph against the child's parameters. A loop, because wrappers
+    # nest: OptimizedModule.__reduce__ rebuilds a deepcopied or unpickled
+    # wrapper without the metadata innermost_fn follows, so torch.compile
+    # wraps it again instead of collapsing onto the module.
+    from torch._dynamo.eval_frame import OptimizedModule
+
+    while isinstance(model, OptimizedModule):
+        model = model._orig_mod
+    return model
+
+
 @dataclass
 class ModelInput:
     """
@@ -1037,9 +1176,64 @@ class AOTCompiledModel:
         return pickle.dumps(data)
 
     @classmethod
-    def deserialize(cls, model: torch.nn.Module, data: bytes) -> "AOTCompiledModel":
+    def deserialize(
+        cls,
+        model: torch.nn.Module,
+        data: bytes,
+        *,
+        guard_globals: dict[str, Any] | None = None,
+    ) -> "AOTCompiledModel":
+        """Rebuild the compiled forward of ``model`` from ``serialize()`` output.
+
+        ``model`` may be the module itself or the wrapper ``torch.compile``
+        returned for it, which is unwrapped to the module that was traced.
+
+        Guards on globals are evaluated, by reference, against the live
+        ``__globals__`` of the function ``model.forward`` resolves to, and the
+        compiled bytecode reads a snapshot, taken here, of the globals serialized
+        with the artifact in which the names a kept guard's own source IS -- not a
+        global reached only through a sub-path of it, and never the recorded
+        ``__builtins_dict___N`` key -- are replaced by that live dict's values. So
+        a value the graph reads live is one a passing guard certifies, every other
+        global is the one it was traced with, and a guarded global the live dict
+        lacks fails the guard rather than falling back to the serialized value.
+        Rebinding a global after the load changes nothing the graph reads unless a
+        guard on its value refuses the call, and the certification is only as strong
+        as the guard's type: a kept ``TENSOR_MATCH`` checks metadata, not values,
+        and a root ``TYPE_MATCH`` on a container checks its type, not the members
+        the graph reads through it. Loading also MUTATES that dict: a recorded
+        ``__import_*`` alias the serialized scope still carries, and that builtins
+        key when a guard source names it, are inserted (never overwriting an
+        existing key) so guards rooted at them resolve in a process that never
+        traced.
+
+        Only when ``get_traced_fn`` cannot resolve ``model.forward`` to a Python
+        function is there no live scope; guards then resolve against the scope
+        rebuilt from the artifact, where they check nothing useful, and a guard
+        rooted at any global but those aliases and that key warns to say so.
+
+        ``guard_globals``, when supplied, is that scope instead of anything
+        resolved from ``model.forward``, so a caller who wants neither the live
+        read nor the write passes its own dict; it is seeded and substituted from
+        on the same terms.
+
+        Hooks registered on ``model`` do not run: the artifact calls ``forward``
+        directly.
+        """
         from torch._dynamo.utils import get_metrics_context
         from torch._guards import compile_context, CompileContext
+
+        # An OptimizedModule's forward is a wrapper defined in eval_frame, so
+        # resolving from it would root every global guard in that module's
+        # namespace (and seed it); dispatch also has to pass the module that was
+        # actually traced as self. eval_frame's own loader unwraps for us; a
+        # caller of this classmethod may not have.
+        model = _unwrap_optimized_module(model)
+
+        forward_not_resolved_reason = None
+        scope = guard_globals
+        if scope is None:
+            scope, forward_not_resolved_reason = _resolve_guard_scope(model)
 
         results: list[bytes] = pickle.loads(data)
         compiled_results = []
@@ -1048,7 +1242,29 @@ class AOTCompiledModel:
                 compile_context(CompileContext(convert_frame.get_compile_id({}))),
                 get_metrics_context(),
             ):
-                compiled_results.append(AOTCompiledFunction.deserialize(result))
+                compiled_results.append(
+                    AOTCompiledFunction.deserialize(
+                        result,
+                        guard_globals=scope,
+                        bytecode_reads_guard_scope=True,
+                        forward_not_resolved_reason=forward_not_resolved_reason,
+                    )
+                )
+        # Model-level, so warn once here rather than once per ModelInput.
+        if forward_not_resolved_reason is not None and any(
+            result._has_global_guards for result in compiled_results
+        ):
+            log.warning(
+                "%s, from which no live guard scope could be resolved "
+                "(get_traced_fn cannot resolve model.forward to a Python "
+                "function); global guards on this artifact resolve against "
+                "the scope rebuilt from the serialized bytecode instead, "
+                "where they check nothing useful: one on a global the graph "
+                "lifted is compared against the value serialized with it and "
+                "cannot fail, and one on a global that scope does not carry "
+                "cannot be satisfied, so the call will report no match",
+                forward_not_resolved_reason,
+            )
         return cls(model, compiled_results)
 
 
