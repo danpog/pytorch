@@ -1356,7 +1356,12 @@ class GuardBuilder(GuardBuilderBase):
         self.lookup_weakrefs = lookup_weakrefs
         self.scope: dict[str, dict[str, object]] = {"L": local_scope, "G": global_scope}
         self.src_get_value_cache: dict[Source, object] = {}
-        self.runtime_global_scope = runtime_global_scope or global_scope
+        # An EMPTY dict is a scope, not the absence of one: falling back on a
+        # falsy dict would re-root a loaded artifact's guards at the globals
+        # serialized with it.
+        self.runtime_global_scope = (
+            global_scope if runtime_global_scope is None else runtime_global_scope
+        )
         self.scope["__builtins__"] = builtins.__dict__.copy()
         for (
             name,
