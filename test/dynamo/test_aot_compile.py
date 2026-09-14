@@ -2468,6 +2468,142 @@ from user code:
         self.assertIn("[0] <guard check failed without naming a guard>", message)
         self.assertIn("Add a ModelInput", message)
 
+    def test_aot_compile_module_disable_guard_check(self):
+        # disable_guard_check() is the escape hatch for an artifact whose guards
+        # fail on the serving machine; module dispatch has to honor it too, or
+        # a module artifact has no opt-out while a function artifact does.
+        model = torch.compile(ScaleModule(), fullgraph=True, backend="aot_eager")
+        model._aot_compile(
+            [ModelInput(args=(torch.randn(3, 3),), kwargs={}, contexts=[])]
+        )
+        # requires_grad is part of TENSOR_MATCH, so the artifact recorded for
+        # requires_grad=False cannot match this call; opting out serves it
+        # anyway, which is exactly the escape hatch -- and what it serves is an
+        # inference graph that aot_autograd's runtime wrapper runs with grad
+        # disabled, so the result carries no grad history. That is what makes the
+        # aot_eager backend above load-bearing: an eager backend installs no such
+        # wrapper and would still record the grad history.
+        x = torch.randn(3, 3, requires_grad=True)
+        with self.assertRaisesRegex(RuntimeError, "requires_grad mismatch"):
+            model(x)
+        model.forward.compiled_results[0].disable_guard_check()
+        out = model(x)
+        self.assertEqual(out, x.detach() * 2)
+        self.assertFalse(out.requires_grad)
+
+    def test_aot_compile_module_opted_out_result_keeps_its_place_in_the_scan(self):
+        self._hide_leaked_dynamo_globals()
+        # Opting out changes what a result accepts, not where it sits: the scan
+        # serves the first result whose guards pass, in index order, and an
+        # opted-out result whose guards genuinely pass is served like any other.
+        # The default guard filter drops the global guard, so both results
+        # accept this call while computing different numbers, and only a mix of
+        # one opted-out and one checked result tells an index-ordered scan from
+        # one that consults the checked results first or holds the opted-out
+        # ones back for the passes below. The call is made under the mode [1]
+        # was traced for, so the graph such a scan serves is the one the process
+        # global would pick, and only the number says which result answered.
+        mod = GlobalConfigModule()
+        model = torch.compile(mod, fullgraph=True, backend="eager")
+        x = torch.randn(4, 8)
+        expected = {}
+        for mode in ("sum", "mean"):
+            with _set_pooling(mode):
+                expected[mode] = mod(x)
+        self.assertNotEqual(expected["sum"].tolist(), expected["mean"].tolist())
+        model._aot_compile(
+            [
+                ModelInput(args=(x,), kwargs={}, contexts=[_set_pooling("sum")]),
+                ModelInput(args=(x,), kwargs={}, contexts=[_set_pooling("mean")]),
+            ]
+        )
+        results = model.forward.compiled_results
+        with _set_pooling("mean"):
+            for result in results:
+                self.assertTrue(result.guard_check(mod, x))
+            results[0].disable_guard_check()
+            self.assertEqual(model(x), expected["sum"])
+
+    def test_aot_compile_module_last_resort_iterates_past_a_checked_result(self):
+        self._hide_leaked_dynamo_globals()
+        # The last resort serves the first result that opted out, which need not
+        # be compiled_results[0]: with [0] still checked, a call no artifact
+        # guards has to walk past it. Reading compiled_results[0] alone -- the
+        # fall-through the parent replaced -- refuses this call instead, and the
+        # ordering cases below cannot see that, since the result they opt out
+        # first IS compiled_results[0].
+        mod = GlobalConfigModule()
+        model = torch.compile(
+            mod,
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": keep_global_guards},
+        )
+        x = torch.randn(4, 8)
+        with _set_pooling("mean"):
+            expected = mod(x)
+        model._aot_compile(
+            [
+                ModelInput(args=(x,), kwargs={}, contexts=[_set_pooling("sum")]),
+                ModelInput(args=(x,), kwargs={}, contexts=[_set_pooling("mean")]),
+            ]
+        )
+        model.forward.compiled_results[1].disable_guard_check()
+        with _set_pooling("other"):
+            self.assertEqual(model(x), expected)
+
+    def test_aot_compile_module_opted_out_result_is_the_last_resort(self):
+        self._hide_leaked_dynamo_globals()
+        # An opted-out result accepts anything, so dispatch reaches it only after
+        # every real guard check has failed -- the scan, and then the second
+        # check() pass above. Two more wrong-answer bugs with no error raised
+        # hide in the rest of that ordering. Consulting the opt-out in the scan
+        # serves the first artifact for a call the second was compiled for --
+        # same shapes, same dtypes, different numbers. And the last resort is
+        # itself ordered: it serves the FIRST opted-out result, so a call no
+        # artifact guards gets the graph the earliest opted-out ModelInput was
+        # traced for. A scan that skipped opted-out results is not pinned here:
+        # the second pass re-checks them and recovers the graph, so only a false
+        # rejection tells the two apart, which
+        # test_module_dispatch_rechecks_an_opted_out_result_whose_tree_accepts
+        # arranges.
+        mod = GlobalConfigModule()
+        model = torch.compile(
+            mod,
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": keep_global_guards},
+        )
+        x = torch.randn(4, 8)
+        expected = {}
+        for mode in ("sum", "mean"):
+            with _set_pooling(mode):
+                expected[mode] = mod(x)
+        self.assertNotEqual(expected["sum"].tolist(), expected["mean"].tolist())
+
+        model._aot_compile(
+            [
+                ModelInput(args=(x,), kwargs={}, contexts=[_set_pooling("sum")]),
+                ModelInput(args=(x,), kwargs={}, contexts=[_set_pooling("mean")]),
+            ]
+        )
+        results = model.forward.compiled_results
+        results[0].disable_guard_check()
+        with _set_pooling("mean"):
+            self.assertEqual(
+                model(x),
+                expected["mean"],
+                msg="the scan must outrank the opted-out result",
+            )
+        # Two opted-out results, so first and last are different results below.
+        results[1].disable_guard_check()
+        with _set_pooling("other"):
+            self.assertEqual(
+                model(x),
+                expected["sum"],
+                msg="the last resort must serve the first opted-out result",
+            )
+
     def test_aot_compile_module_scope_resolves_through_forward_hook(self):
         # A registered forward hook makes get_traced_fn(model) return
         # Module._wrapped_call_impl, whose globals are torch/nn/modules/module.py.
